@@ -9,12 +9,22 @@ export interface LlmStreamOptions {
 
 export interface LlmProvider {
   name: LlmProviderName;
+  model?: string;
   stream: (prompt: string, options: LlmStreamOptions) => Promise<void>;
 }
+
+export type ProviderFailureReason =
+  | "http_error"
+  | "empty_response"
+  | "timeout"
+  | "network_error"
+  | "invalid_stream"
+  | "provider_error";
 
 export interface ProviderErrorDetails {
   name: string;
   message: string;
+  reason: ProviderFailureReason;
   statusCode?: number;
   code?: string;
 }
@@ -23,7 +33,13 @@ export interface GenerateOptions {
   timeoutMs: number;
   retryBaseDelayMs: number;
   onChunk: (chunk: string) => void;
-  onProviderError?: (failure: { provider: LlmProviderName; attempt: number; error: unknown }) => void;
+  onProviderError?: (failure: {
+    provider: LlmProviderName;
+    model?: string;
+    attempt: number;
+    reason: ProviderFailureReason;
+    error: unknown;
+  }) => void;
 }
 
 export interface GenerationResult {
@@ -34,18 +50,39 @@ export interface GenerationResult {
 export class ProviderHttpError extends Error {
   statusCode: number;
 
-  constructor(statusCode: number, message: string) {
-    super(message);
+  constructor(statusCode: number) {
+    super(`Provider returned HTTP ${statusCode}`);
     this.name = "ProviderHttpError";
     this.statusCode = statusCode;
   }
 }
 
+class EmptyProviderResponseError extends Error {
+  constructor(provider: LlmProviderName) {
+    super(`${provider} returned an empty response`);
+    this.name = "EmptyProviderResponseError";
+  }
+}
+
+class InvalidProviderStreamError extends Error {
+  constructor() {
+    super("Provider returned an invalid stream");
+    this.name = "InvalidProviderStreamError";
+  }
+}
+
+class ProviderTimeoutError extends Error {
+  constructor() {
+    super("Provider request timed out");
+    this.name = "ProviderTimeoutError";
+  }
+}
+
 const maxAttemptsPerProvider = 3;
 const defaultGeminiModel = "gemini-3.8-flash";
-const defaultDeepseekModel = "deepseek-chat";
-const defaultGrokModel = "grok-3-mini";
-const deepseekEndpoint = "https://api.deepseek.com/v1/chat/completions";
+const defaultDeepseekModel = "deepseek-flash";
+const defaultGrokModel = "grok-4.7";
+const deepseekEndpoint = "https://api.deepseek.com/chat/completions";
 const grokEndpoint = "https://api.x.ai/v1/chat/completions";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -115,10 +152,26 @@ export function describeProviderError(error: unknown, secrets: string[]): Provid
     // Keep the original SDK error message when it is not JSON.
   }
 
+  const reason: ProviderFailureReason =
+    error instanceof ProviderTimeoutError
+      ? "timeout"
+      : error instanceof ProviderHttpError || statusCode !== undefined
+        ? "http_error"
+        : error instanceof EmptyProviderResponseError
+          ? "empty_response"
+          : error instanceof InvalidProviderStreamError
+            ? "invalid_stream"
+            : isRecord(error) &&
+                typeof error.code === "string" &&
+                /^(ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|UND_ERR)/.test(error.code)
+              ? "network_error"
+              : "provider_error";
+
   message = redactSecrets(message, secrets).trim();
   return {
     name,
     message: message || "Unknown LLM provider error",
+    reason,
     ...(statusCode === undefined ? {} : { statusCode }),
     ...(code === undefined ? {} : { code }),
   };
@@ -127,6 +180,7 @@ export function describeProviderError(error: unknown, secrets: string[]): Provid
 function createGeminiProvider(apiKey: string, model: string): LlmProvider {
   return {
     name: "gemini",
+    model,
     async stream(prompt, { signal, onChunk }) {
       const ai = new GoogleGenAI({ apiKey });
       const stream = await ai.models.generateContentStream({
@@ -162,6 +216,7 @@ function createChatCompletionsProvider({
 }): LlmProvider {
   return {
     name,
+    model,
     async stream(prompt, { signal, onChunk }) {
       const response = await fetch(endpoint, {
         method: "POST",
@@ -179,22 +234,53 @@ function createChatCompletionsProvider({
       });
 
       if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        const detail = body ? `: ${redactSecrets(body.slice(0, 300), [apiKey])}` : "";
-        throw new ProviderHttpError(response.status, `${name} returned HTTP ${response.status}${detail}`);
+        await response.body?.cancel();
+        throw new ProviderHttpError(response.status);
       }
 
       if (!response.body) {
-        throw new Error(`${name} returned an empty response`);
+        throw new EmptyProviderResponseError(name);
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
 
+      const processLine = (line: string): boolean => {
+        const trimmedLine = line.trim();
+        if (!trimmedLine.startsWith("data:")) {
+          return false;
+        }
+
+        const data = trimmedLine.slice("data:".length).trim();
+        if (data === "[DONE]") {
+          return true;
+        }
+
+        let payload: unknown;
+        try {
+          payload = JSON.parse(data) as unknown;
+        } catch {
+          throw new InvalidProviderStreamError();
+        }
+
+        if (isRecord(payload) && payload.error) {
+          throw new InvalidProviderStreamError();
+        }
+
+        const chunk = (payload as ChatCompletionChunk).choices?.[0]?.delta?.content;
+        if (chunk) {
+          onChunk(chunk);
+        }
+        return false;
+      };
+
       for (;;) {
         const { done, value } = await reader.read();
         if (done) {
+          if (buffer.trim()) {
+            processLine(buffer);
+          }
           return;
         }
 
@@ -205,19 +291,9 @@ function createChatCompletionsProvider({
           buffer = buffer.slice(newline + 1);
           newline = buffer.indexOf("\n");
 
-          if (!line.startsWith("data:")) {
-            continue;
-          }
-
-          const data = line.slice("data:".length).trim();
-          if (data === "[DONE]") {
+          if (processLine(line)) {
             await reader.cancel();
             return;
-          }
-
-          const chunk = (JSON.parse(data) as ChatCompletionChunk).choices?.[0]?.delta?.content;
-          if (chunk) {
-            onChunk(chunk);
           }
         }
       }
@@ -231,7 +307,7 @@ export function getConfiguredLlmProviders(): LlmProvider[] {
 
   const geminiKey = readSecret(process.env.GEMINI_API_KEY);
   if (geminiKey) {
-    providers.push(createGeminiProvider(geminiKey, process.env.GEMINI_MODEL || defaultGeminiModel));
+    providers.push(createGeminiProvider(geminiKey, readSecret(process.env.GEMINI_MODEL) || defaultGeminiModel));
   }
 
   const deepseekKey = readSecret(process.env.DEEPSEEK_API_KEY);
@@ -241,7 +317,7 @@ export function getConfiguredLlmProviders(): LlmProvider[] {
         name: "deepseek",
         endpoint: deepseekEndpoint,
         apiKey: deepseekKey,
-        model: process.env.DEEPSEEK_MODEL || defaultDeepseekModel,
+        model: readSecret(process.env.DEEPSEEK_MODEL) || defaultDeepseekModel,
       }),
     );
   }
@@ -253,7 +329,7 @@ export function getConfiguredLlmProviders(): LlmProvider[] {
         name: "grok",
         endpoint: grokEndpoint,
         apiKey: grokKey,
-        model: process.env.GROK_MODEL || defaultGrokModel,
+        model: readSecret(process.env.GROK_MODEL) || defaultGrokModel,
       }),
     );
   }
@@ -283,7 +359,7 @@ export async function generateWithFailover(
     for (let attempt = 0; attempt < maxAttemptsPerProvider; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(
-        () => controller.abort(new Error(`${provider.name} timed out after ${options.timeoutMs} ms`)),
+        () => controller.abort(new ProviderTimeoutError()),
         options.timeoutMs,
       );
 
@@ -297,25 +373,40 @@ export async function generateWithFailover(
           },
         });
 
+        if (controller.signal.aborted) {
+          failure = new ProviderTimeoutError();
+        }
+
+        if (failure) {
+          throw failure;
+        }
+
         if (content) {
           return { provider: provider.name, content };
         }
-        failure = new Error(`${provider.name} returned an empty response`);
+        failure = new EmptyProviderResponseError(provider.name);
       } catch (error) {
-        failure = error;
+        failure = controller.signal.aborted ? new ProviderTimeoutError() : error;
       } finally {
         clearTimeout(timer);
       }
 
       lastError = failure;
-      options.onProviderError?.({ provider: provider.name, attempt: attempt + 1, error: failure });
+      const details = describeProviderError(failure, []);
+      options.onProviderError?.({
+        provider: provider.name,
+        ...(provider.model === undefined ? {} : { model: provider.model }),
+        attempt: attempt + 1,
+        reason: details.reason,
+        error: failure,
+      });
 
       if (content) {
         throw failure;
       }
 
       const isLastAttempt = attempt === maxAttemptsPerProvider - 1;
-      if (describeProviderError(failure, []).statusCode !== 503 || isLastAttempt) {
+      if (details.statusCode !== 503 || isLastAttempt) {
         break;
       }
 

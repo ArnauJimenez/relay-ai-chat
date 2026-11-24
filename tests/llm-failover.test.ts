@@ -23,7 +23,7 @@ function generationOptions(overrides: { timeoutMs?: number; onChunk?: (chunk: st
 describe("generateWithFailover", () => {
   it("switches to the next provider when one fails before streaming", async () => {
     const primary = fakeProvider("gemini", async () => {
-      throw new ProviderHttpError(500, "internal");
+      throw new ProviderHttpError(500);
     });
     const secondary = fakeProvider("deepseek", async (_prompt, { onChunk }) => {
       onChunk("Hola ");
@@ -60,7 +60,7 @@ describe("generateWithFailover", () => {
     const primary = fakeProvider("gemini", async (_prompt, { onChunk }) => {
       calls += 1;
       if (calls === 1) {
-        throw new ProviderHttpError(503, "overloaded");
+        throw new ProviderHttpError(503);
       }
       onChunk("listo");
     });
@@ -89,21 +89,30 @@ describe("generateWithFailover", () => {
   it("treats an empty answer as a failure and tries the next provider", async () => {
     const silent = fakeProvider("gemini", async () => undefined);
     const backup = fakeProvider("grok", async (_prompt, { onChunk }) => onChunk("ok"));
+    const onProviderError = vi.fn();
 
-    const result = await generateWithFailover("hola", [silent, backup], generationOptions());
+    const result = await generateWithFailover("hola", [silent, backup], {
+      ...generationOptions(),
+      onProviderError,
+    });
 
     expect(result.provider).toBe("grok");
+    expect(onProviderError).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "gemini", reason: "empty_response" }),
+    );
   });
 
   it("throws the last provider error when every provider fails", async () => {
     const first = fakeProvider("gemini", async () => {
-      throw new Error("first failed");
+      throw new ProviderHttpError(500);
     });
     const second = fakeProvider("deepseek", async () => {
-      throw new ProviderHttpError(401, "bad key");
+      throw new ProviderHttpError(401);
     });
 
-    await expect(generateWithFailover("hola", [first, second], generationOptions())).rejects.toThrow("bad key");
+    await expect(generateWithFailover("hola", [first, second], generationOptions())).rejects.toThrow(
+      "Provider returned HTTP 401",
+    );
   });
 
   it("fails clearly when no provider is configured", async () => {
@@ -140,11 +149,65 @@ describe("provider defaults", () => {
 
     const calls = fetchMock.mock.calls as unknown as [string, RequestInit][];
     const [deepseekCall, grokCall] = calls;
-    expect(deepseekCall?.[0]).toBe("https://api.deepseek.com/v1/chat/completions");
-    expect(JSON.parse(String(deepseekCall?.[1].body))).toMatchObject({ model: "deepseek-chat", stream: true });
+    expect(deepseekCall?.[0]).toBe("https://api.deepseek.com/chat/completions");
+    expect(JSON.parse(String(deepseekCall?.[1].body))).toMatchObject({ model: "deepseek-flash", stream: true });
     expect(grokCall?.[0]).toBe("https://api.x.ai/v1/chat/completions");
-    expect(JSON.parse(String(grokCall?.[1].body))).toMatchObject({ model: "grok-3-mini", stream: true });
+    expect(JSON.parse(String(grokCall?.[1].body))).toMatchObject({ model: "grok-4.7", stream: true });
 
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("parses a final SSE data line without a trailing newline", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("DEEPSEEK_API_KEY", "deepseek-key");
+    vi.stubEnv("XAI_API_KEY", "");
+    vi.stubEnv("DEEPSEEK_MODEL", "");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response('data: {"choices":[{"delta":{"content":"final"}}]}', { status: 200 })),
+    );
+    const chunks: string[] = [];
+    const provider = getConfiguredLlmProviders()[0];
+
+    await provider?.stream("hola", {
+      signal: new AbortController().signal,
+      onChunk: (chunk) => chunks.push(chunk),
+    });
+
+    expect(chunks).toEqual(["final"]);
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("reports HTTP failure metadata without retaining the provider response body", async () => {
+    const responseBody = "sensitive echoed request content";
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("DEEPSEEK_API_KEY", "deepseek-key");
+    vi.stubEnv("XAI_API_KEY", "");
+    vi.stubEnv("DEEPSEEK_MODEL", "");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ error: { message: responseBody } }), { status: 401 })),
+    );
+    const onProviderError = vi.fn();
+
+    await expect(
+      generateWithFailover("private prompt", getConfiguredLlmProviders(), {
+        ...generationOptions(),
+        onProviderError,
+      }),
+    ).rejects.toThrow("Provider returned HTTP 401");
+
+    expect(onProviderError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "deepseek",
+        model: "deepseek-flash",
+        reason: "http_error",
+      }),
+    );
+    expect(JSON.stringify(onProviderError.mock.calls)).not.toContain(responseBody);
+    expect(JSON.stringify(onProviderError.mock.calls)).not.toContain("private prompt");
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
   });
@@ -152,10 +215,11 @@ describe("provider defaults", () => {
 
 describe("describeProviderError", () => {
   it("redacts configured secrets and keeps the HTTP status", () => {
-    const details = describeProviderError(new ProviderHttpError(401, "invalid key sk-secret-123"), ["sk-secret-123"]);
+    const details = describeProviderError(new ProviderHttpError(401), ["sk-secret-123"]);
 
     expect(details.statusCode).toBe(401);
-    expect(details.message).toBe("invalid key [REDACTED]");
+    expect(details.reason).toBe("http_error");
+    expect(details.message).toBe("Provider returned HTTP 401");
   });
 
   it("reads nested Gemini-style JSON error payloads", () => {

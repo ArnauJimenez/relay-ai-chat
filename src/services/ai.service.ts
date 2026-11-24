@@ -64,15 +64,16 @@ export async function streamAiResponse(
           chunk,
         });
       },
-      onProviderError: ({ provider, attempt, error }) => {
+      onProviderError: ({ provider, model, attempt, reason, error }) => {
         const details = describeProviderError(error, secrets);
         logger.warn(
           {
             provider,
+            model,
             attempt,
+            failureReason: reason,
+            errorType: details.name,
             statusCode: details.statusCode,
-            apiCode: details.code,
-            errorMessage: details.message,
             roomId,
             messageId,
           },
@@ -100,15 +101,9 @@ export async function streamAiResponse(
     const details = describeProviderError(error, secrets);
     logger.error(
       {
-        err: {
-          type: details.name,
-          message: details.message,
-          ...(error instanceof Error && error.stack
-            ? { stack: redactSecrets(error.stack, secrets) }
-            : {}),
-        },
+        errorType: details.name,
+        failureReason: details.reason,
         statusCode: details.statusCode,
-        apiCode: details.code,
         roomId,
         messageId,
       },
@@ -126,7 +121,11 @@ export async function streamAiResponse(
         });
       } catch (persistenceError) {
         logger.error(
-          { err: persistenceError, roomId, messageId },
+          {
+            errorType: persistenceError instanceof Error ? persistenceError.name : "Error",
+            roomId,
+            messageId,
+          },
           "Could not persist failed AI message status",
         );
       }
