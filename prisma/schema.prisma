@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum RoomType {
+  DIRECT
+  GROUP
+  AI_ASSISTANT
+}
+
+enum MessageStatus {
+  STREAMING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id           String       @id @default(uuid())
+  email        String       @unique
+  username     String       @unique
+  passwordHash String
+  avatarUrl    String?
+  lastSeen     DateTime     @default(now())
+  isDemo       Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  memberships  RoomMember[]
+  messages     Message[]
+
+  @@index([email])
+  @@index([isDemo, createdAt])
+}
+
+model Room {
+  id          String       @id @default(uuid())
+  name        String?
+  type        RoomType     @default(GROUP)
+  // Sorted "userA:userB" key for DIRECT rooms; guarantees one DM per pair even under races.
+  directKey   String?      @unique
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  members     RoomMember[]
+  messages    Message[]
+}
+
+model RoomMember {
+  id         String   @id @default(uuid())
+  userId     String
+  roomId     String
+  joinedAt   DateTime @default(now())
+  lastReadAt DateTime @default(now())
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room       Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roomId])
+  @@index([roomId])
+  @@index([userId])
+}
+
+model Message {
+  id        String        @id @default(uuid())
+  roomId    String
+  senderId  String?       // Null cuando el remitente es el asistente IA
+  isAi      Boolean       @default(false)
+  content   String        @db.Text
+  status    MessageStatus @default(COMPLETED)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  room      Room          @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  sender    User?         @relation(fields: [senderId], references: [id], onDelete: SetNull)
+
+  @@index([roomId, createdAt])
+}
