@@ -71,32 +71,38 @@ export async function createGuestSession() {
   const bot = await getDemoBot();
   const suffix = randomUUID().replaceAll("-", "").slice(0, 12);
 
-  return prisma.user.create({
-    data: {
-      email: `guest-${suffix}@${demoEmailDomain}`,
-      username: `guest_${suffix}`,
-      passwordHash: await getUnusablePasswordHash(),
-      isDemo: true,
-      memberships: {
-        create: [
-          {
-            room: {
-              create: {
-                type: "DIRECT",
-                members: { create: { userId: bot.id } },
-                messages: { create: { senderId: bot.id, content: welcomeMessage } },
-              },
-            },
-          },
-          {
-            room: {
-              create: { name: "Asistente IA de demo", type: "AI_ASSISTANT" },
-            },
-          },
-        ],
+  return prisma.$transaction(async (transaction) => {
+    const guest = await transaction.user.create({
+      data: {
+        email: `guest-${suffix}@${demoEmailDomain}`,
+        username: `guest_${suffix}`,
+        passwordHash: await getUnusablePasswordHash(),
+        isDemo: true,
       },
-    },
-    select: guestSelect,
+      select: guestSelect,
+    });
+
+    await transaction.room.create({
+      data: {
+        type: "DIRECT",
+        members: {
+          create: [{ userId: guest.id }, { userId: bot.id }],
+        },
+        messages: {
+          create: { senderId: bot.id, content: welcomeMessage },
+        },
+      },
+    });
+
+    await transaction.room.create({
+      data: {
+        name: "Asistente IA de demo",
+        type: "AI_ASSISTANT",
+        members: { create: { userId: guest.id } },
+      },
+    });
+
+    return guest;
   });
 }
 
