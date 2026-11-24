@@ -1,7 +1,10 @@
 import axios from "axios";
 import type { AuthResponse, Message, Room, RoomType, UserSummary } from "../types";
+import { normalizeApiBaseUrl } from "./api-url";
 
-export const apiBaseUrl = import.meta.env.VITE_API_URL || "http://127.0.0.1:3001/api";
+export const apiBaseUrl = normalizeApiBaseUrl(
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:3001/api",
+);
 // Socket.io shares the API's origin unless VITE_SOCKET_URL points somewhere else.
 export const socketUrl = import.meta.env.VITE_SOCKET_URL || new URL(apiBaseUrl).origin;
 
