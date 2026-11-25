@@ -31,7 +31,6 @@ export interface ProviderErrorDetails {
 
 export interface GenerateOptions {
   timeoutMs: number;
-  retryBaseDelayMs: number;
   onChunk: (chunk: string) => void;
   onProviderError?: (failure: {
     provider: LlmProviderName;
@@ -78,7 +77,7 @@ class ProviderTimeoutError extends Error {
   }
 }
 
-const maxAttemptsPerProvider = 3;
+const maxProviderTimeoutMs = 8_000;
 const defaultGeminiModel = "gemini-3.8-flash";
 const defaultGroqModel = "openai/gpt-oss-20b";
 const defaultMistralModel = "mistral-small-latest";
@@ -93,15 +92,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export function readSecret(value: string | undefined): string {
   return (value ?? "")
     .trim()
     .replace(/^(['"])(.*)\1$/, "$2")
     .trim();
+}
+
+export function getLlmProviderTimeoutMs(value = process.env.AI_PROVIDER_TIMEOUT_MS): number {
+  const configured = Number(value);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.min(configured, maxProviderTimeoutMs)
+    : maxProviderTimeoutMs;
 }
 
 export function getLlmSecrets(): string[] {
@@ -315,6 +317,18 @@ function createChatCompletionsProvider({
 export function getConfiguredLlmProviders(): LlmProvider[] {
   const providers: LlmProvider[] = [];
 
+  const groqKey = readSecret(process.env.GROQ_API_KEY);
+  if (groqKey) {
+    providers.push(
+      createChatCompletionsProvider({
+        name: "groq",
+        endpoint: groqEndpoint,
+        apiKey: groqKey,
+        model: readSecret(process.env.GROQ_MODEL) || defaultGroqModel,
+      }),
+    );
+  }
+
   const geminiKey = readSecret(process.env.GEMINI_API_KEY);
   if (geminiKey) {
     providers.push(createGeminiProvider(geminiKey, readSecret(process.env.GEMINI_MODEL) || defaultGeminiModel));
@@ -327,13 +341,6 @@ export function getConfiguredLlmProviders(): LlmProvider[] {
     model: string;
     modelOverride: string | undefined;
   }[] = [
-    {
-      name: "groq",
-      key: readSecret(process.env.GROQ_API_KEY),
-      endpoint: groqEndpoint,
-      model: defaultGroqModel,
-      modelOverride: process.env.GROQ_MODEL,
-    },
     {
       name: "mistral",
       key: readSecret(process.env.MISTRAL_API_KEY),
@@ -376,10 +383,8 @@ export function getConfiguredLlmProviders(): LlmProvider[] {
 }
 
 /**
- * Tries each provider in order. Every attempt has its own AbortController timeout.
- * A failure switches to the next provider, except after text has already reached the
- * client (switching then would mix two answers). HTTP 503 is retried on the same provider
- * with exponential backoff before failing over.
+ * Tries each provider once in order, with an individual timeout.
+ * A failure switches to the next provider unless text has already reached the client.
  */
 export async function generateWithFailover(
   prompt: string,
@@ -394,61 +399,52 @@ export async function generateWithFailover(
   let lastError: unknown = new Error("No LLM provider produced a response");
 
   for (const provider of providers) {
-    for (let attempt = 0; attempt < maxAttemptsPerProvider; attempt++) {
-      const controller = new AbortController();
-      const timer = setTimeout(
-        () => controller.abort(new ProviderTimeoutError()),
-        options.timeoutMs,
-      );
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new ProviderTimeoutError()),
+      options.timeoutMs,
+    );
 
-      let failure: unknown;
-      try {
-        await provider.stream(prompt, {
-          signal: controller.signal,
-          onChunk: (chunk) => {
-            content += chunk;
-            options.onChunk(chunk);
-          },
-        });
-
-        if (controller.signal.aborted) {
-          failure = new ProviderTimeoutError();
-        }
-
-        if (failure) {
-          throw failure;
-        }
-
-        if (content) {
-          return { provider: provider.name, content };
-        }
-        failure = new EmptyProviderResponseError(provider.name);
-      } catch (error) {
-        failure = controller.signal.aborted ? new ProviderTimeoutError() : error;
-      } finally {
-        clearTimeout(timer);
-      }
-
-      lastError = failure;
-      const details = describeProviderError(failure, []);
-      options.onProviderError?.({
-        provider: provider.name,
-        ...(provider.model === undefined ? {} : { model: provider.model }),
-        attempt: attempt + 1,
-        reason: details.reason,
-        error: failure,
+    let failure: unknown;
+    try {
+      await provider.stream(prompt, {
+        signal: controller.signal,
+        onChunk: (chunk) => {
+          content += chunk;
+          options.onChunk(chunk);
+        },
       });
 
-      if (content) {
+      if (controller.signal.aborted) {
+        failure = new ProviderTimeoutError();
+      }
+
+      if (failure) {
         throw failure;
       }
 
-      const isLastAttempt = attempt === maxAttemptsPerProvider - 1;
-      if (details.statusCode !== 503 || isLastAttempt) {
-        break;
+      if (content) {
+        return { provider: provider.name, content };
       }
+      failure = new EmptyProviderResponseError(provider.name);
+    } catch (error) {
+      failure = controller.signal.aborted ? new ProviderTimeoutError() : error;
+    } finally {
+      clearTimeout(timer);
+    }
 
-      await sleep(options.retryBaseDelayMs * 2 ** attempt);
+    lastError = failure;
+    const details = describeProviderError(failure, []);
+    options.onProviderError?.({
+      provider: provider.name,
+      ...(provider.model === undefined ? {} : { model: provider.model }),
+      attempt: 1,
+      reason: details.reason,
+      error: failure,
+    });
+
+    if (content) {
+      throw failure;
     }
   }
 

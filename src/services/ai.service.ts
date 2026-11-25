@@ -4,18 +4,11 @@ import {
   describeProviderError,
   generateWithFailover,
   getConfiguredLlmProviders,
+  getLlmProviderTimeoutMs,
   getLlmSecrets,
   redactSecrets,
 } from "./llm-providers.js";
 import { prisma } from "./prisma.service.js";
-
-const defaultProviderTimeoutMs = 45_000;
-const retryBaseDelayMs = 1_000;
-
-function getProviderTimeoutMs(): number {
-  const configured = Number(process.env.AI_PROVIDER_TIMEOUT_MS);
-  return Number.isFinite(configured) && configured > 0 ? configured : defaultProviderTimeoutMs;
-}
 
 export async function streamAiResponse(
   roomId: string,
@@ -56,8 +49,7 @@ export async function streamAiResponse(
     }
 
     const result = await generateWithFailover(prompt, providers, {
-      timeoutMs: getProviderTimeoutMs(),
-      retryBaseDelayMs,
+      timeoutMs: getLlmProviderTimeoutMs(),
       onChunk: (chunk) => {
         content += chunk;
         ioInstance.to(roomId).emit("ai:stream_chunk", {

@@ -3,6 +3,7 @@ import {
   describeProviderError,
   generateWithFailover,
   getConfiguredLlmProviders,
+  getLlmProviderTimeoutMs,
   ProviderHttpError,
   type LlmProvider,
   type LlmProviderName,
@@ -15,7 +16,6 @@ function fakeProvider(name: LlmProviderName, stream: LlmProvider["stream"]): Llm
 function generationOptions(overrides: { timeoutMs?: number; onChunk?: (chunk: string) => void } = {}) {
   return {
     timeoutMs: overrides.timeoutMs ?? 1_000,
-    retryBaseDelayMs: 0,
     onChunk: overrides.onChunk ?? (() => undefined),
   };
 }
@@ -55,22 +55,17 @@ describe("generateWithFailover", () => {
     expect(stalled.stream).toHaveBeenCalledTimes(1);
   });
 
-  it("retries HTTP 503 on the same provider before failing over", async () => {
-    let calls = 0;
+  it.each([429, 503])("fails over after a single HTTP %i response", async (statusCode) => {
     const primary = fakeProvider("gemini", async (_prompt, { onChunk }) => {
-      calls += 1;
-      if (calls === 1) {
-        throw new ProviderHttpError(503);
-      }
-      onChunk("listo");
+      throw new ProviderHttpError(statusCode);
     });
-    const backup = fakeProvider("mistral", async () => undefined);
+    const backup = fakeProvider("groq", async (_prompt, { onChunk }) => onChunk("listo"));
 
     const result = await generateWithFailover("hola", [primary, backup], generationOptions());
 
-    expect(result).toEqual({ provider: "gemini", content: "listo" });
-    expect(primary.stream).toHaveBeenCalledTimes(2);
-    expect(backup.stream).not.toHaveBeenCalled();
+    expect(result).toEqual({ provider: "groq", content: "listo" });
+    expect(primary.stream).toHaveBeenCalledTimes(1);
+    expect(backup.stream).toHaveBeenCalledTimes(1);
   });
 
   it("does not switch providers after text already reached the client", async () => {
@@ -123,7 +118,14 @@ describe("generateWithFailover", () => {
 });
 
 describe("provider defaults", () => {
-  it("configures Gemini and the four new providers in failover order", () => {
+  it("defaults the provider timeout to 8 seconds and never allows a longer override", () => {
+    expect(getLlmProviderTimeoutMs(undefined)).toBe(8_000);
+    expect(getLlmProviderTimeoutMs("12000")).toBe(8_000);
+    expect(getLlmProviderTimeoutMs("3000")).toBe(3_000);
+    expect(getLlmProviderTimeoutMs("invalid")).toBe(8_000);
+  });
+
+  it("configures the five providers in latency-first failover order", () => {
     vi.stubEnv("GEMINI_API_KEY", "gemini-key");
     vi.stubEnv("GROQ_API_KEY", "groq-key");
     vi.stubEnv("MISTRAL_API_KEY", "mistral-key");
@@ -133,8 +135,8 @@ describe("provider defaults", () => {
     vi.stubEnv("XAI_API_KEY", "legacy-key");
 
     expect(getConfiguredLlmProviders().map((provider) => provider.name)).toEqual([
-      "gemini",
       "groq",
+      "gemini",
       "mistral",
       "openrouter",
       "cerebras",
@@ -190,6 +192,18 @@ describe("provider defaults", () => {
     ]);
 
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("puts Groq before Gemini when both providers are configured", () => {
+    vi.stubEnv("GROQ_API_KEY", "groq-key");
+    vi.stubEnv("GEMINI_API_KEY", "gemini-key");
+    vi.stubEnv("MISTRAL_API_KEY", "");
+    vi.stubEnv("OPENROUTER_API_KEY", "");
+    vi.stubEnv("CEREBRAS_API_KEY", "");
+
+    expect(getConfiguredLlmProviders().map((provider) => provider.name)).toEqual(["groq", "gemini"]);
+
     vi.unstubAllEnvs();
   });
 

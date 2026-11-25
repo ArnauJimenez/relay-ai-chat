@@ -84,13 +84,13 @@ must move to a shared store (for example Redis) before horizontal scaling.
 **LLM failover with bounded latency and no mixed answers.**
 
 ```
-Gemini ──timeout/error──▶ Groq ──timeout/error──▶ Mistral
+Groq ──timeout/error──▶ Gemini ──timeout/error──▶ Mistral
                        ──timeout/error──▶ OpenRouter ──timeout/error──▶ Cerebras
 ```
 
-- Each attempt runs under its own `AbortController` with a timeout (default 45 s, `AI_PROVIDER_TIMEOUT_MS`).
+- Each provider gets one attempt under its own `AbortController`, with an 8 s timeout. `AI_PROVIDER_TIMEOUT_MS` may lower this limit but cannot raise it.
 - Providers are tried in order. A provider that is not configured (no API key) is skipped.
-- HTTP 503 responses are retried up to three times with exponential backoff; failures are logged by provider, model, attempt, category, and status without logging API keys or response bodies.
+- HTTP errors (including 429 and 503), timeouts, network errors, and empty responses immediately move to the next provider. Failures are logged by provider, model, attempt, category, and status without logging API keys or response bodies.
 - **Clean cut after the first chunk:** once any text has been streamed to the client, a failure marks the message `FAILED` instead of switching providers. Two models never write into the same answer.
 - If every provider fails, the message is persisted as `FAILED` and the client gets an `error:event`.
 
@@ -164,7 +164,7 @@ npm run dev                   # http://127.0.0.1:5174
 | `OPENROUTER_API_KEY` | at least one provider key | Failover provider |
 | `CEREBRAS_API_KEY` | at least one provider key | Failover provider |
 | `GEMINI_MODEL` / `GROQ_MODEL` / `MISTRAL_MODEL` / `OPENROUTER_MODEL` / `CEREBRAS_MODEL` | no | Model overrides (`gemini-3.8-flash` / `openai/gpt-oss-20b` / `mistral-small-latest` / `openrouter/free` / `qwen-3.8-27b`) |
-| `AI_PROVIDER_TIMEOUT_MS` | no | Per-attempt timeout, default `45000` |
+| `AI_PROVIDER_TIMEOUT_MS` | no | Per-provider timeout in milliseconds (default and maximum `8000`; may be lowered) |
 | `PORT` | no | Defaults to `3000` locally; Render sets it automatically |
 
 ### Frontend variables (`client/`)
