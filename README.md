@@ -6,7 +6,7 @@ answers token by token. It is built as a production-style system: JWT-secured
 REST and WebSocket APIs, PostgreSQL behind Prisma, rate limits on every costly
 path, and a multi-provider LLM failover chain.
 
-**Live demo:** `https://<your-app>.vercel.app` — click **Entrar como invitado / Demo**. No sign-up needed.
+**Live demo:** `https://relay-ai-chat-seven.vercel.app` — click **Entrar como invitado / Demo**. No sign-up needed.
 
 ---
 
@@ -37,7 +37,7 @@ in user search. Their accounts and rooms are deleted after 24 hours.
      ├── Socket handlers room:join · message:send · typing:* · presence
      ├── Demo service    guest sessions · bot replies · TTL cleanup
      └── AI service      persist STREAMING message → failover chain → stream chunks
-                              Gemini → Groq → Mistral → OpenRouter → Cerebras
+                              Groq → Gemini → Mistral → OpenRouter → Cerebras
      │
      ▼  Prisma 7 + @prisma/adapter-pg
   PostgreSQL (Neon)      User · Room · RoomMember · Message
@@ -139,16 +139,20 @@ Requirements: Node.js 24, a PostgreSQL database, and at least one LLM API key.
 
 ```bash
 # Backend (repository root)
-cp .env.example .env          # set DATABASE_URL, JWT_SECRET and one LLM key
+cp .env.example .env
+# Set DATABASE_URL, JWT_SECRET and at least one LLM key in .env.
 npm install
-npm run db:deploy             # apply migrations (use db:migrate while developing)
-npm run dev                   # http://127.0.0.1:3001
+# Apply existing migrations; use db:migrate while developing schema changes.
+npm run db:deploy
+# Starts the API at http://127.0.0.1:3001.
+npm run dev
 
 # Frontend
 cd client
 cp .env.example .env
 npm install
-npm run dev                   # http://127.0.0.1:5174
+# Starts the frontend at http://127.0.0.1:5174.
+npm run dev
 ```
 
 ### Environment variables (backend)
@@ -158,8 +162,8 @@ npm run dev                   # http://127.0.0.1:5174
 | `DATABASE_URL` | yes | PostgreSQL connection string (`sslmode=require` on Neon) |
 | `JWT_SECRET` | yes | Signs session tokens |
 | `CORS_ORIGIN` | yes in production | Comma-separated frontend origins, or `*` |
-| `GEMINI_API_KEY` | at least one provider key | Primary provider |
-| `GROQ_API_KEY` | at least one provider key | Failover provider |
+| `GROQ_API_KEY` | at least one provider key | Primary provider |
+| `GEMINI_API_KEY` | at least one provider key | First fallback provider |
 | `MISTRAL_API_KEY` | at least one provider key | Failover provider |
 | `OPENROUTER_API_KEY` | at least one provider key | Failover provider |
 | `CEREBRAS_API_KEY` | at least one provider key | Failover provider |
@@ -184,20 +188,25 @@ never point at localhost by accident.
 ```bash
 # Backend type check and unit suites (no database needed)
 npx tsc --noEmit -p tsconfig.test.json
-npx vitest run tests/llm-failover.test.ts tests/rate-limit-cors.test.ts \
-  tests/database-errors.test.ts tests/users-rooms.route.test.ts
+npx vitest run \
+  tests/llm-failover.test.ts \
+  tests/rate-limit-cors.test.ts \
+  tests/database-errors.test.ts \
+  tests/users-rooms.route.test.ts
 
 # Full suite, including end-to-end API and Socket.io tests (needs a migrated DATABASE_URL)
 npm test
 
 # Frontend type check, lint and production build
-cd client && npm run build && npm run lint
+cd client
+npm run build && npm run lint
 ```
 
-The unit suites cover the failover chain (timeouts, 503 retries, clean cut
-after the first chunk), provider endpoints and default models, rate limiting,
-CORS parsing, database error classification, user search validation and field
-selection, and DM deduplication. They use mocked Prisma and fake providers.
+The unit suites cover the failover chain (timeouts, immediate failover on provider
+errors, and clean cut after the first chunk), provider endpoints and default
+models, rate limiting, CORS parsing, database error classification, user search
+validation and field selection, and DM deduplication. They use mocked Prisma and
+fake providers.
 The integration suite runs against a real database.
 
 ---
