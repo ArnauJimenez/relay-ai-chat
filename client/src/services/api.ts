@@ -19,7 +19,7 @@ export function getApiErrorMessage(error: unknown, fallback: string): string {
   }
 
   if (!error.response) {
-    return `Cannot reach the API at ${apiBaseUrl}. Start the proyecto3 backend and try again.`;
+    return "Server not available. Please try again in a moment.";
   }
 
   const responseData: unknown = error.response.data;
