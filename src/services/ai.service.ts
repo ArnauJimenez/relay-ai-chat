@@ -50,7 +50,9 @@ export async function streamAiResponse(
 
     const providers = getConfiguredLlmProviders();
     if (providers.length === 0) {
-      throw new Error("No LLM API key is configured (GEMINI_API_KEY, DEEPSEEK_API_KEY or XAI_API_KEY)");
+      throw new Error(
+        "No LLM API key is configured (GEMINI_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY or CEREBRAS_API_KEY)",
+      );
     }
 
     const result = await generateWithFailover(prompt, providers, {

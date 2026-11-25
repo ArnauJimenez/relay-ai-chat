@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 
-export type LlmProviderName = "gemini" | "deepseek" | "grok";
+export type LlmProviderName = "gemini" | "groq" | "mistral" | "openrouter" | "cerebras";
 
 export interface LlmStreamOptions {
   signal: AbortSignal;
@@ -80,10 +80,14 @@ class ProviderTimeoutError extends Error {
 
 const maxAttemptsPerProvider = 3;
 const defaultGeminiModel = "gemini-3.8-flash";
-const defaultDeepseekModel = "deepseek-flash";
-const defaultGrokModel = "grok-4.7";
-const deepseekEndpoint = "https://api.deepseek.com/chat/completions";
-const grokEndpoint = "https://api.x.ai/v1/chat/completions";
+const defaultGroqModel = "openai/gpt-oss-20b";
+const defaultMistralModel = "mistral-small-latest";
+const defaultOpenRouterModel = "openrouter/free";
+const defaultCerebrasModel = "qwen-3.8-27b";
+const groqEndpoint = "https://api.groq.com/openai/v1/chat/completions";
+const mistralEndpoint = "https://api.mistral.ai/openai/v1/chat/completions";
+const openRouterEndpoint = "https://openrouter.ai/api/v1/chat/completions";
+const cerebrasEndpoint = "https://api.cerebras.ai/v1/chat/completions";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -101,7 +105,13 @@ export function readSecret(value: string | undefined): string {
 }
 
 export function getLlmSecrets(): string[] {
-  return [process.env.GEMINI_API_KEY, process.env.DEEPSEEK_API_KEY, process.env.XAI_API_KEY]
+  return [
+    process.env.GEMINI_API_KEY,
+    process.env.GROQ_API_KEY,
+    process.env.MISTRAL_API_KEY,
+    process.env.OPENROUTER_API_KEY,
+    process.env.CEREBRAS_API_KEY,
+  ]
     .map(readSecret)
     .filter(Boolean);
 }
@@ -202,7 +212,7 @@ interface ChatCompletionChunk {
   choices?: { delta?: { content?: string | null } }[];
 }
 
-// DeepSeek and xAI both expose OpenAI-compatible chat completions with SSE streaming.
+// These providers expose OpenAI-compatible chat completions with SSE streaming.
 function createChatCompletionsProvider({
   name,
   endpoint,
@@ -301,7 +311,7 @@ function createChatCompletionsProvider({
   };
 }
 
-/** Providers in failover order: Gemini, then DeepSeek, then Grok. Only configured ones are returned. */
+/** Providers are tried in order; providers without configured keys are omitted. */
 export function getConfiguredLlmProviders(): LlmProvider[] {
   const providers: LlmProvider[] = [];
 
@@ -310,26 +320,54 @@ export function getConfiguredLlmProviders(): LlmProvider[] {
     providers.push(createGeminiProvider(geminiKey, readSecret(process.env.GEMINI_MODEL) || defaultGeminiModel));
   }
 
-  const deepseekKey = readSecret(process.env.DEEPSEEK_API_KEY);
-  if (deepseekKey) {
-    providers.push(
-      createChatCompletionsProvider({
-        name: "deepseek",
-        endpoint: deepseekEndpoint,
-        apiKey: deepseekKey,
-        model: readSecret(process.env.DEEPSEEK_MODEL) || defaultDeepseekModel,
-      }),
-    );
-  }
+  const configuredChatProviders: {
+    name: Exclude<LlmProviderName, "gemini">;
+    key: string | undefined;
+    endpoint: string;
+    model: string;
+    modelOverride: string | undefined;
+  }[] = [
+    {
+      name: "groq",
+      key: readSecret(process.env.GROQ_API_KEY),
+      endpoint: groqEndpoint,
+      model: defaultGroqModel,
+      modelOverride: process.env.GROQ_MODEL,
+    },
+    {
+      name: "mistral",
+      key: readSecret(process.env.MISTRAL_API_KEY),
+      endpoint: mistralEndpoint,
+      model: defaultMistralModel,
+      modelOverride: process.env.MISTRAL_MODEL,
+    },
+    {
+      name: "openrouter",
+      key: readSecret(process.env.OPENROUTER_API_KEY),
+      endpoint: openRouterEndpoint,
+      model: defaultOpenRouterModel,
+      modelOverride: process.env.OPENROUTER_MODEL,
+    },
+    {
+      name: "cerebras",
+      key: readSecret(process.env.CEREBRAS_API_KEY),
+      endpoint: cerebrasEndpoint,
+      model: defaultCerebrasModel,
+      modelOverride: process.env.CEREBRAS_MODEL,
+    },
+  ];
 
-  const grokKey = readSecret(process.env.XAI_API_KEY);
-  if (grokKey) {
+  for (const provider of configuredChatProviders) {
+    if (!provider.key) {
+      continue;
+    }
+
     providers.push(
       createChatCompletionsProvider({
-        name: "grok",
-        endpoint: grokEndpoint,
-        apiKey: grokKey,
-        model: readSecret(process.env.GROK_MODEL) || defaultGrokModel,
+        name: provider.name,
+        endpoint: provider.endpoint,
+        apiKey: provider.key,
+        model: readSecret(provider.modelOverride) || provider.model,
       }),
     );
   }

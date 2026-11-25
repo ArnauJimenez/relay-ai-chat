@@ -15,7 +15,7 @@ path, and a multi-provider LLM failover chain.
 1. Open the app and press **Entrar como invitado / Demo**.
 2. You get an isolated guest account (token valid 24 h) with two rooms ready:
    - a **direct message with `relay_guide`**, a demo bot that replies in real time, and
-   - an **AI assistant** room backed by Gemini (with failover to DeepSeek and Grok).
+   - an **AI assistant** room backed by Gemini, Groq, Mistral, OpenRouter, and Cerebras.
 3. To test messaging, open **New conversation → Try the demo bot**. One click opens a DM.
    To test with another person, search by email or username in the same dialog.
 
@@ -37,7 +37,7 @@ in user search. Their accounts and rooms are deleted after 24 hours.
      ├── Socket handlers room:join · message:send · typing:* · presence
      ├── Demo service    guest sessions · bot replies · TTL cleanup
      └── AI service      persist STREAMING message → failover chain → stream chunks
-                              Gemini ──timeout/error──▶ DeepSeek ──timeout/error──▶ Grok
+                              Gemini → Groq → Mistral → OpenRouter → Cerebras
      │
      ▼  Prisma 7 + @prisma/adapter-pg
   PostgreSQL (Neon)      User · Room · RoomMember · Message
@@ -84,15 +84,13 @@ must move to a shared store (for example Redis) before horizontal scaling.
 **LLM failover with bounded latency and no mixed answers.**
 
 ```
-attempt  Gemini   ── 503 ──▶ retry (1 s, 2 s backoff, max 3 tries)
-                  ── timeout / error ──▶
-attempt  DeepSeek ── timeout / error ──▶      deepseek-chat   /v1/chat/completions
-                                       ▶
-attempt  Grok                                 grok-3-mini     api.x.ai/v1/chat/completions
+Gemini ──timeout/error──▶ Groq ──timeout/error──▶ Mistral
+                       ──timeout/error──▶ OpenRouter ──timeout/error──▶ Cerebras
 ```
 
 - Each attempt runs under its own `AbortController` with a timeout (default 45 s, `AI_PROVIDER_TIMEOUT_MS`).
 - Providers are tried in order. A provider that is not configured (no API key) is skipped.
+- HTTP 503 responses are retried up to three times with exponential backoff; failures are logged by provider, model, attempt, category, and status without logging API keys or response bodies.
 - **Clean cut after the first chunk:** once any text has been streamed to the client, a failure marks the message `FAILED` instead of switching providers. Two models never write into the same answer.
 - If every provider fails, the message is persisted as `FAILED` and the client gets an `error:event`.
 
@@ -115,7 +113,7 @@ guest. Expired guests are removed hourly, along with rooms left without members.
 | Frontend | React 19, Vite 8, TypeScript, Socket.io client, Axios, Tailwind CSS 4 |
 | API | Node.js 24, Express 5, Socket.io 4, Zod 4, JWT, bcryptjs, pino |
 | Data | PostgreSQL (Neon), Prisma 7 with `@prisma/adapter-pg` |
-| AI | `@google/genai` (Gemini), DeepSeek and xAI via OpenAI-compatible chat completions |
+| AI | `@google/genai` (Gemini), plus Groq, Mistral, OpenRouter, and Cerebras via OpenAI-compatible chat completions |
 | Testing | Vitest, Supertest, socket.io-client |
 | Hosting | Vercel (client), Render (API, `render.yaml` blueprint), Neon (database) |
 
@@ -160,10 +158,12 @@ npm run dev                   # http://127.0.0.1:5174
 | `DATABASE_URL` | yes | PostgreSQL connection string (`sslmode=require` on Neon) |
 | `JWT_SECRET` | yes | Signs session tokens |
 | `CORS_ORIGIN` | yes in production | Comma-separated frontend origins, or `*` |
-| `GEMINI_API_KEY` | one of the three | Primary provider |
-| `DEEPSEEK_API_KEY` | one of the three | Failover provider |
-| `XAI_API_KEY` | one of the three | Failover provider (Grok) |
-| `GEMINI_MODEL` / `DEEPSEEK_MODEL` / `GROK_MODEL` | no | Model overrides (`gemini-3.8-flash` / `deepseek-chat` / `grok-3-mini`) |
+| `GEMINI_API_KEY` | at least one provider key | Primary provider |
+| `GROQ_API_KEY` | at least one provider key | Failover provider |
+| `MISTRAL_API_KEY` | at least one provider key | Failover provider |
+| `OPENROUTER_API_KEY` | at least one provider key | Failover provider |
+| `CEREBRAS_API_KEY` | at least one provider key | Failover provider |
+| `GEMINI_MODEL` / `GROQ_MODEL` / `MISTRAL_MODEL` / `OPENROUTER_MODEL` / `CEREBRAS_MODEL` | no | Model overrides (`gemini-3.8-flash` / `openai/gpt-oss-20b` / `mistral-small-latest` / `openrouter/free` / `qwen-3.8-27b`) |
 | `AI_PROVIDER_TIMEOUT_MS` | no | Per-attempt timeout, default `45000` |
 | `PORT` | no | Defaults to `3000` locally; Render sets it automatically |
 
@@ -224,4 +224,3 @@ Migrations live in `prisma/migrations/`: `init` creates the schema and
 - **Email is visible to signed-in users through search.** This is the intended discovery model, but it allows enumeration. Rate limiting and guest exclusion limit the impact. A stricter model would add a per-user visibility setting.
 - **No consent step for group membership.** Any member can add an existing user to a group room.
 - **Session tokens live in `localStorage`.** That is acceptable for this demo scope. A production version should use `httpOnly` cookies with CSRF protection.
-- **xAI adapter.** The Grok adapter targets OpenAI-compatible chat completions. Verify it against a live key before relying on it.
