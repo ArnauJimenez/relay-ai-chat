@@ -1,7 +1,7 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { ArrowRight, Bot, LoaderCircle, LockKeyhole, Mail, Sparkles, UserRound } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
-import { getApiErrorMessage } from "../services/api";
+import { apiBaseUrl, getApiErrorMessage } from "../services/api";
 
 export function AuthScreen() {
   const { login, loginAsGuest, register } = useAuth();
@@ -12,6 +12,13 @@ export function AuthScreen() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [demoLoading, setDemoLoading] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch(new URL("/health", apiBaseUrl), { signal: controller.signal }).catch(() => undefined);
+
+    return () => controller.abort();
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
